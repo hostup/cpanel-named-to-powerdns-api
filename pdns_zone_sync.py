@@ -44,39 +44,48 @@ def parse_zone_file(zone_file_path, zone_exists):
                 continue
 
             name = parts[0]
-            if 'IN' not in parts:
-                continue  # Skip if 'IN' is not in the line
-
-            in_index = parts.index('IN')
-            ttl = last_ttl if parts[in_index - 1].isdigit() else default_ttl
-            last_ttl = int(parts[in_index - 1]) if parts[in_index - 1].isdigit() else last_ttl
-
-            rtype = parts[in_index + 1]
-            if zone_exists and rtype in ['NS', 'SOA']:
-                continue
-
-            if rtype == 'NS':
-                ns_record_exists = True  # Set flag if NS record is found
-
-            rdata = ' '.join(parts[in_index + 2:])
             if name == '@':
                 name = domain_name
             elif not name.endswith('.'):
                 name += f".{domain_name}"
 
+            # Extract TTL and Record Type
+            ttl_index = 1 if parts[1].isdigit() else -1
+            ttl = int(parts[ttl_index]) if ttl_index > -1 else last_ttl
+            last_ttl = ttl if ttl_index > -1 else last_ttl
+
+            rtype_index = 3 if ttl_index == 1 else 2
+            rtype = parts[rtype_index]
+
+            # Skip if record type is invalid
+            if rtype not in ['A', 'AAAA', 'CNAME', 'MX', 'NS', 'SOA', 'TXT', 'SRV', 'PTR', 'DKIM']:
+                continue
+
+            # Skip NS and SOA records if the zone exists
+            if zone_exists and rtype in ['NS', 'SOA']:
+                continue
+
+            # Flag NS record existence
+            if rtype == 'NS':
+                ns_record_exists = True
+
+            # Extract rdata
+            rdata_start_index = rtype_index + 1
+            rdata = ' '.join(parts[rdata_start_index:])
+
+            # Add record to rrsets
             key = (name, rtype)
             if key not in rrsets:
                 rrsets[key] = {
                     "name": name,
                     "type": rtype,
                     "ttl": ttl,
-                    "records": []
+                    "records": [{"content": rdata, "disabled": False}]
                 }
-            rrsets[key]["records"].append({"content": rdata, "disabled": False})
 
+        # Add default SOA record for new zones if not provided
         if not soa_provided and not zone_exists:
-            # Add default SOA record for new zones
-            default_soa = "ns1.hostup.se. hostmaster." + domain_name + " 2023120501 10800 3600 604800 3600"
+            default_soa = f"ns1.hostup.se. hostmaster.{domain_name} 2023120501 10800 3600 604800 3600"
             rrsets[(domain_name, "SOA")] = {
                 "name": domain_name,
                 "type": "SOA",
@@ -84,12 +93,10 @@ def parse_zone_file(zone_file_path, zone_exists):
                 "records": [{"content": default_soa, "disabled": False}]
             }
 
+        # Add NS records only if they don't already exist in the zone file for new zones
         if not ns_record_exists and not zone_exists:
-            # Add NS records only if they don't already exist in the zone file
-            ns_records = [
-                {"content": "ns1.hostup.se.", "disabled": False},
-                {"content": "ns2.hostup.se.", "disabled": False}
-            ]
+            ns_records = [{"content": "ns1.hostup.se.", "disabled": False},
+                          {"content": "ns2.hostup.se.", "disabled": False}]
             ns_record_set = {
                 "name": domain_name,
                 "type": "NS",
@@ -153,11 +160,48 @@ def update_zone(domain_name, zone_file_path, zone_exists):
         ]
     }
     url = f"{pdns_api_url}/servers/localhost/zones/{domain_name}"
+
     try:
         response = requests.patch(url, headers=headers, json=payload)
-        logging.info(f"PATCH request to {url}. Response: {response.status_code}, Body: {response.text}")
+        if response.status_code == 422 and "Conflicts with pre-existing RRset" in response.text:
+            handle_conflict(domain_name, records, url)
+        else:
+            logging.info(f"PATCH request to {url}. Response: {response.status_code}, Body: {response.text}")
     except Exception as e:
         logging.error(f"Error updating zone {domain_name}: {e}")
+        logging.error(traceback.format_exc())
+
+def handle_conflict(domain_name, records, url):
+    # Logic to remove conflicting records
+    for record in records:
+        if record['type'] == 'CNAME':
+            remove_conflicting_records(domain_name, record, url)
+    
+    # Retry updating the zone after removing conflicts
+    try:
+        response = requests.patch(url, headers=headers, json={"rrsets": records})
+        logging.info(f"Retried PATCH request to {url}. Response: {response.status_code}, Body: {response.text}")
+    except Exception as e:
+        logging.error(f"Error re-updating zone {domain_name}: {e}")
+        logging.error(traceback.format_exc())
+
+def remove_conflicting_records(domain_name, cname_record, url):
+    # Identify the conflicting A record and remove it
+    cname_name = cname_record['name']
+    remove_payload = {
+        "rrsets": [
+            {
+                "name": cname_name,
+                "type": "A",
+                "changetype": "DELETE"
+            }
+        ]
+    }
+    try:
+        response = requests.patch(url, headers=headers, json=remove_payload)
+        logging.info(f"Removed conflicting A record for {cname_name}. Response: {response.status_code}, Body: {response.text}")
+    except Exception as e:
+        logging.error(f"Error removing conflicting record for {cname_name}: {e}")
         logging.error(traceback.format_exc())
 
 def main():
